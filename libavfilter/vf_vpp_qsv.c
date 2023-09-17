@@ -23,6 +23,7 @@
 
 #include <float.h>
 
+#include "config.h"
 #include "config_components.h"
 
 #include "libavutil/opt.h"
@@ -37,9 +38,14 @@
 #include "internal.h"
 #include "avfilter.h"
 #include "filters.h"
+#include "lut3d.h"
 
 #include "qsvvpp.h"
 #include "transpose.h"
+
+#if QSV_ONEVPL && CONFIG_VAAPI
+#include <va/va.h>
+#endif
 
 #define OFFSET(x) offsetof(VPPContext, x)
 #define FLAGS (AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_FILTERING_PARAM)
@@ -67,6 +73,10 @@ typedef struct VPPContext{
     /** HDR parameters attached on the input frame */
     mfxExtMasteringDisplayColourVolume mdcv_conf;
     mfxExtContentLightLevelInfo clli_conf;
+
+    /** LUT parameters attached on the input frame */
+    mfxExtVPP3DLut lut3d_conf;
+    LUT3DContext lut3d;
 #endif
 
     /**
@@ -260,6 +270,7 @@ static av_cold int vpp_preinit(AVFilterContext *ctx)
 
 static av_cold int vpp_init(AVFilterContext *ctx)
 {
+    int ret = 0;
     VPPContext  *vpp  = ctx->priv;
 
     if (!vpp->output_format_str || !strcmp(vpp->output_format_str, "same")) {
@@ -288,9 +299,9 @@ static av_cold int vpp_init(AVFilterContext *ctx)
     STRING_OPTION(color_primaries, color_primaries, AVCOL_PRI_UNSPECIFIED);
     STRING_OPTION(color_transfer,  color_transfer,  AVCOL_TRC_UNSPECIFIED);
     STRING_OPTION(color_matrix,    color_space,     AVCOL_SPC_UNSPECIFIED);
-
 #undef STRING_OPTION
-    return 0;
+
+    return ret;
 }
 
 static int config_input(AVFilterLink *inlink)
@@ -388,6 +399,194 @@ static mfxStatus get_mfx_version(const AVFilterContext *ctx, mfxVersion *mfx_ver
     return MFXQueryVersion(device_hwctx->session, mfx_version);
 }
 
+#if QSV_ONEVPL && CONFIG_VAAPI
+static mfxStatus get_va_display(AVFilterContext *ctx, VADisplay *va_display)
+{
+    VPPContext *vpp = ctx->priv;
+    QSVVPPContext *qsvvpp = &vpp->qsv;
+    mfxHDL handle;
+    mfxStatus ret;
+
+    ret = MFXVideoCORE_GetHandle(qsvvpp->session, MFX_HANDLE_VA_DISPLAY, &handle);
+    if (ret != MFX_ERR_NONE) {
+        av_log(ctx, AV_LOG_ERROR, "MFXVideoCORE_GetHandle failed, status: %d\n", ret);
+        *va_display = NULL;
+        return ret;
+    }
+
+    *va_display = (VADisplay)handle;
+    return MFX_ERR_NONE;
+}
+
+// Allocate memory on device and copy 3D LUT table.
+// Reference https://spec.oneapi.io/onevpl/2.9.0/programming_guide/VPL_prg_vpp.html#video-processing-3dlut
+static int init_3dlut_surface(AVFilterContext *ctx)
+{
+    VPPContext *vpp = ctx->priv;
+    LUT3DContext *lut3d = &vpp->lut3d;
+    mfxExtVPP3DLut *lut3d_conf = &vpp->lut3d_conf;
+
+    VAStatus ret = 0;
+    VADisplay va_dpy = 0;
+    VASurfaceID surface_id = 0;
+    VASurfaceAttrib surface_attrib;
+    VAImage surface_image;
+    mfxU16 *surface_u16 = NULL;
+    mfx3DLutMemoryLayout mem_layout;
+    mfxMemId mem_id = 0;
+
+    int lut_size = lut3d->lutsize;
+    int mul_size = 0;
+
+    int r, g, b, lut_idx, sf_idx;
+    struct rgbvec *s = NULL;
+
+    av_log(ctx, AV_LOG_VERBOSE, "create 3D LUT surface, size: %u.\n", lut_size);
+
+    switch (lut_size) {
+    case 17:
+        mul_size = 32;
+        mem_layout = MFX_3DLUT_MEMORY_LAYOUT_INTEL_17LUT;
+        break;
+    case 33:
+        mul_size = 64;
+        mem_layout = MFX_3DLUT_MEMORY_LAYOUT_INTEL_33LUT;
+        break;
+    case 65:
+        mul_size = 128;
+        mem_layout = MFX_3DLUT_MEMORY_LAYOUT_INTEL_65LUT;
+        break;
+    default:
+        av_log(ctx, AV_LOG_ERROR, "3D LUT surface supports only LUT size: 17, 33, 65.");
+        return AVERROR(EINVAL);
+    }
+
+    ret = get_va_display(ctx, &va_dpy);
+    if (ret != VA_STATUS_SUCCESS) {
+        av_log(ctx, AV_LOG_ERROR, "get VADisplay failed, unable to create 3D LUT surface.\n");
+        return ret;
+    }
+
+    memset(&surface_attrib, 0, sizeof(surface_attrib));
+    surface_attrib.type = VASurfaceAttribPixelFormat;
+    surface_attrib.flags = VA_SURFACE_ATTRIB_SETTABLE;
+    surface_attrib.value.type = VAGenericValueTypeInteger;
+    surface_attrib.value.value.i = VA_FOURCC_RGBA;
+
+    ret = vaCreateSurfaces(va_dpy,
+                           VA_RT_FORMAT_RGB32,  // 4 bytes
+                           lut_size * mul_size, // width
+                           lut_size * 2,        // height
+                           &surface_id, 1,
+                           &surface_attrib, 1);
+    if (ret != VA_STATUS_SUCCESS) {
+        av_log(ctx, AV_LOG_ERROR, "vaCreateSurfaces for 3D LUT surface failed, status: %d %s\n", ret, vaErrorStr(ret));
+        return AVERROR(ret);
+    }
+    av_log(ctx, AV_LOG_DEBUG, "3D LUT surface id %u\n", surface_id);
+
+    ret = vaSyncSurface(va_dpy, surface_id);
+    if (ret != VA_STATUS_SUCCESS) {
+        av_log(ctx, AV_LOG_ERROR, "vaSyncSurface for 3D LUT surface failed, status: %d %s\n", ret, vaErrorStr(ret));
+        goto err_destroy_surface;
+    }
+
+    memset(&surface_image, 0, sizeof(surface_image));
+    ret = vaDeriveImage(va_dpy, surface_id, &surface_image);
+    if (ret != VA_STATUS_SUCCESS) {
+        av_log(ctx, AV_LOG_ERROR, "vaDeriveImage for 3D LUT surface failed, status: %d %s\n", ret, vaErrorStr(ret));
+        goto err_destroy_surface;
+    }
+    if (surface_image.format.fourcc != VA_FOURCC_RGBA) {
+        av_log(ctx, AV_LOG_ERROR, "vaDeriveImage format is not expected VA_FOURCC_RGBA, got 0x%x\n", surface_image.format.fourcc);
+        goto err_destroy_image;
+    }
+
+    // Map surface to system memory for copy 3D LUT table.
+    ret = vaMapBuffer(va_dpy, surface_image.buf, (void **)&surface_u16);
+    if (ret != VA_STATUS_SUCCESS) {
+        av_log(ctx, AV_LOG_ERROR, "vaMapBuffer for 3D LUT surface failed, status: %d %s\n", ret, vaErrorStr(ret));
+        goto err_destroy_image;
+    }
+
+    // Copy 3D LUT to surface.
+    memset(surface_u16, 0, surface_image.width * surface_image.height * 4);
+#define INTEL_3DLUT_SCALE (UINT16_MAX - 1)
+    for (r = 0; r < lut_size; ++r) {
+        for (g = 0; g < lut_size; ++g) {
+            for (b = 0; b < lut_size; ++b) {
+                lut_idx = r * lut_size * lut_size + g * lut_size + b;
+                s = &lut3d->lut[lut_idx];
+
+                sf_idx = (r * lut_size * mul_size + g * mul_size + b) * 4;
+                surface_u16[sf_idx + 0] = (mfxU16)(s->r * INTEL_3DLUT_SCALE);
+                surface_u16[sf_idx + 1] = (mfxU16)(s->g * INTEL_3DLUT_SCALE);
+                surface_u16[sf_idx + 2] = (mfxU16)(s->b * INTEL_3DLUT_SCALE);
+                // surface_u16[sf_idx + 4] is reserved channel.
+            }
+        }
+    }
+#undef INTEL_3DLUT_SCALE
+
+    if (vaUnmapBuffer(va_dpy, surface_image.buf)) {
+        av_log(ctx, AV_LOG_ERROR, "vaUnmapBuffer for 3D LUT surface failed, status: %d %s\n", ret, vaErrorStr(ret));
+        goto err_destroy_image;
+    }
+    vaDestroyImage(va_dpy, surface_image.image_id);
+
+    mem_id = av_malloc(sizeof(VASurfaceID));
+    if (mem_id == 0) {
+        ret = AVERROR(ENOMEM);
+        goto err_destroy_surface;
+    }
+
+    av_log(ctx, AV_LOG_DEBUG,
+           "upload 3D LUT surface width %d, height %d\n",
+           (int)surface_image.width, (int)surface_image.height);
+
+    memset(lut3d_conf, 0, sizeof(*lut3d_conf));
+    lut3d_conf->Header.BufferId = MFX_EXTBUFF_VPP_3DLUT;
+    lut3d_conf->Header.BufferSz = sizeof(*lut3d_conf);
+    lut3d_conf->ChannelMapping = MFX_3DLUT_CHANNEL_MAPPING_RGB_RGB;
+    lut3d_conf->BufferType = MFX_RESOURCE_VA_SURFACE;
+    lut3d_conf->VideoBuffer.DataType = MFX_DATA_TYPE_U16;
+    lut3d_conf->VideoBuffer.MemLayout = mem_layout;
+    lut3d_conf->VideoBuffer.MemId = mem_id;
+    *((VASurfaceID*)lut3d_conf->VideoBuffer.MemId) = surface_id;
+
+    return 0;
+
+err_destroy_image:
+    vaDestroyImage(va_dpy, surface_image.image_id);
+err_destroy_surface:
+    vaDestroySurfaces(va_dpy, &surface_id, 1);
+    return ret;
+}
+
+static int uninit_3dlut_surface(AVFilterContext *ctx) {
+    VPPContext *vpp = ctx->priv;
+    mfxExtVPP3DLut *lut3d_conf = &vpp->lut3d_conf;
+    VADisplay va_dpy = 0;
+    int ret;
+
+    if (lut3d_conf->Header.BufferId == MFX_EXTBUFF_VPP_3DLUT) {
+        ret = get_va_display(ctx, &va_dpy);
+        if (!va_dpy) {
+            return ret;
+        }
+        ret = vaDestroySurfaces(va_dpy, (VASurfaceID*)lut3d_conf->VideoBuffer.MemId, 1);
+        if (ret != VA_STATUS_SUCCESS) {
+            av_log(ctx, AV_LOG_ERROR, "vaDestroySurfaces failed, status: %d %s\n", ret, vaErrorStr(ret) );
+            return ret;
+        }
+        av_free(lut3d_conf->VideoBuffer.MemId);
+    }
+    memset(lut3d_conf, 0, sizeof(*lut3d_conf));
+
+    return 0;
+}
+#endif // QSV_ONEVPL && CONFIG_VAAPI
+
 static int vpp_set_frame_ext_params(AVFilterContext *ctx, const AVFrame *in, AVFrame *out,  QSVVPPFrameParam *fp)
 {
 #if QSV_ONEVPL
@@ -401,6 +600,7 @@ static int vpp_set_frame_ext_params(AVFilterContext *ctx, const AVFrame *in, AVF
 
     fp->num_ext_buf = 0;
 
+    av_log(ctx, AV_LOG_DEBUG, "vpp_set_frame_ext_params QSV_ONEVPL\n");
     if (!in || !out ||
         !QSV_RUNTIME_VERSION_ATLEAST(qsvvpp->ver, 2, 0))
         return 0;
@@ -499,6 +699,13 @@ static int vpp_set_frame_ext_params(AVFilterContext *ctx, const AVFrame *in, AVF
     outvsi_conf.MatrixCoefficients       = (out->colorspace == AVCOL_SPC_UNSPECIFIED) ? AVCOL_SPC_BT709 : out->colorspace;
     outvsi_conf.ColourDescriptionPresent = 1;
 
+#if CONFIG_VAAPI
+    if (vpp->lut3d.file && (vpp->lut3d_conf.Header.BufferId == 0)) {
+        // 3D LUT does not depend on in/out frame, so initialize just once.
+        init_3dlut_surface(ctx);
+    }
+#endif
+
     if (memcmp(&vpp->invsi_conf, &invsi_conf, sizeof(mfxExtVideoSignalInfo)) ||
         memcmp(&vpp->mdcv_conf, &mdcv_conf, sizeof(mfxExtMasteringDisplayColourVolume)) ||
         memcmp(&vpp->clli_conf, &clli_conf, sizeof(mfxExtContentLightLevelInfo)) ||
@@ -516,6 +723,10 @@ static int vpp_set_frame_ext_params(AVFilterContext *ctx, const AVFrame *in, AVF
         vpp->clli_conf                     = clli_conf;
         if (clli_conf.Header.BufferId)
             fp->ext_buf[fp->num_ext_buf++] = (mfxExtBuffer*)&vpp->clli_conf;
+
+        if (vpp->lut3d_conf.Header.BufferId) {
+            fp->ext_buf[fp->num_ext_buf++] = (mfxExtBuffer *)&vpp->lut3d_conf;
+        }
     }
 #endif
 
@@ -524,6 +735,7 @@ static int vpp_set_frame_ext_params(AVFilterContext *ctx, const AVFrame *in, AVF
 
 static int config_output(AVFilterLink *outlink)
 {
+    int ret;
     AVFilterContext *ctx = outlink->src;
     VPPContext      *vpp = ctx->priv;
     QSVVPPParam     param = { NULL };
@@ -711,9 +923,17 @@ static int config_output(AVFilterLink *outlink)
         vpp->color_transfer != AVCOL_TRC_UNSPECIFIED ||
         vpp->color_matrix != AVCOL_SPC_UNSPECIFIED ||
         vpp->tonemap ||
-        !vpp->has_passthrough)
+        vpp->lut3d.file ||
+        !vpp->has_passthrough) {
+        if (vpp->lut3d.file) {
+            av_log(ctx, AV_LOG_INFO, "load 3D LUT from file: %s\n", vpp->lut3d.file);
+            ret = ff_lut3d_init(ctx, &vpp->lut3d);
+            if (ret != 0) {
+                return ret;
+            }
+        }
         return ff_qsvvpp_init(ctx, &param);
-    else {
+    } else {
         /* No MFX session is created in this case */
         av_log(ctx, AV_LOG_VERBOSE, "qsv vpp pass through mode.\n");
         if (inlink->hw_frames_ctx)
@@ -801,6 +1021,15 @@ eof:
 
 static av_cold void vpp_uninit(AVFilterContext *ctx)
 {
+    VPPContext *vpp = ctx->priv;
+
+#if QSV_ONEVPL && CONFIG_VAAPI
+    uninit_3dlut_surface(ctx);
+#endif
+
+    if (vpp->lut3d.file) {
+        ff_lut3d_uninit(&vpp->lut3d);
+    }
     ff_qsvvpp_close(ctx);
 }
 
@@ -924,7 +1153,9 @@ static const AVOption vpp_options[] = {
       OFFSET(color_transfer_str),  AV_OPT_TYPE_STRING, { .str = NULL }, .flags = FLAGS },
 
     {"tonemap", "Perform tonemapping (0=disable tonemapping, 1=perform tonemapping if the input has HDR metadata)", OFFSET(tonemap), AV_OPT_TYPE_INT, {.i64 = 0 }, 0, 1, .flags = FLAGS},
-
+#if QSV_ONEVPL && CONFIG_VAAPI
+    { "lut3d_file", "Load and apply 3D LUT file", OFFSET(lut3d) + offsetof(LUT3DContext, file), AV_OPT_TYPE_STRING, { .str = NULL }, .flags = FLAGS },
+#endif
     { NULL }
 };
 
