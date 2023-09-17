@@ -37,6 +37,7 @@
 #include "internal.h"
 #include "avfilter.h"
 #include "filters.h"
+#include "lut3d.h"
 
 #include "qsvvpp.h"
 #include "transpose.h"
@@ -67,6 +68,13 @@ typedef struct VPPContext{
     /** HDR parameters attached on the input frame */
     mfxExtMasteringDisplayColourVolume mdcv_conf;
     mfxExtContentLightLevelInfo clli_conf;
+
+    /** LUT parameters attached on the input frame */
+    mfxExtVPP3DLut lut3d_conf;
+    LUT3DContext lut3d;
+    mfxU16* lut3d_r;
+    mfxU16* lut3d_g;
+    mfxU16* lut3d_b;
 #endif
 
     /**
@@ -388,6 +396,75 @@ static mfxStatus get_mfx_version(const AVFilterContext *ctx, mfxVersion *mfx_ver
     return MFXQueryVersion(device_hwctx->session, mfx_version);
 }
 
+#if QSV_ONEVPL
+// Create 3D LUT surface using system memory.
+// Reference https://spec.oneapi.io/onevpl/2.9.0/programming_guide/VPL_prg_vpp.html#video-processing-3dlut
+static void init_3dlut_surface(AVFilterContext *ctx)
+{
+    VPPContext *vpp = ctx->priv;
+    LUT3DContext *lut3d = &vpp->lut3d;
+    mfxExtVPP3DLut *lut3d_conf = &vpp->lut3d_conf;
+    int r, g, b, idx;
+    struct rgbvec *v = NULL;
+    int lut_size = lut3d->lutsize;
+    int lut_size2 = lut_size * lut_size;
+    int lut_size3 = lut_size * lut_size2;
+
+    av_log(ctx, AV_LOG_DEBUG, "create 3D LUT surface with system memory, LUT size: %d.\n", lut_size);
+
+    vpp->lut3d_r = av_calloc(lut_size3, sizeof(mfxU16));
+    vpp->lut3d_g = av_calloc(lut_size3, sizeof(mfxU16));
+    vpp->lut3d_b = av_calloc(lut_size3, sizeof(mfxU16));
+
+    // Copy 3D LUT to system memory surface.
+    for (r = 0, idx = 0; r < lut_size; ++r) {
+        for (g = 0; g < lut_size; ++g) {
+            for (b = 0; b < lut_size; ++b) {
+                v = &lut3d->lut[r * lut_size2 + g * lut_size + b];
+
+                vpp->lut3d_r[idx] = (mfxU16)(v->r * UINT16_MAX);
+                vpp->lut3d_g[idx] = (mfxU16)(v->g * UINT16_MAX);
+                vpp->lut3d_b[idx] = (mfxU16)(v->b * UINT16_MAX);
+                idx++;
+            }
+        }
+    }
+
+    memset(lut3d_conf, 0, sizeof(*lut3d_conf));
+    lut3d_conf->Header.BufferId = MFX_EXTBUFF_VPP_3DLUT;
+    lut3d_conf->Header.BufferSz = sizeof(*lut3d_conf);
+    lut3d_conf->ChannelMapping = MFX_3DLUT_CHANNEL_MAPPING_RGB_RGB;
+    lut3d_conf->BufferType = MFX_RESOURCE_SYSTEM_SURFACE;
+
+    lut3d_conf->SystemBuffer.Channel[0].DataType = MFX_DATA_TYPE_U16;
+    lut3d_conf->SystemBuffer.Channel[0].Size = lut_size;
+    lut3d_conf->SystemBuffer.Channel[0].Data16 = vpp->lut3d_r;
+
+    lut3d_conf->SystemBuffer.Channel[1].DataType = MFX_DATA_TYPE_U16;
+    lut3d_conf->SystemBuffer.Channel[1].Size = lut_size;
+    lut3d_conf->SystemBuffer.Channel[1].Data16 = vpp->lut3d_g;
+
+    lut3d_conf->SystemBuffer.Channel[2].DataType = MFX_DATA_TYPE_U16;
+    lut3d_conf->SystemBuffer.Channel[2].Size = lut_size;
+    lut3d_conf->SystemBuffer.Channel[2].Data16 = vpp->lut3d_b;
+}
+
+static void uninit_3dlut_surface(AVFilterContext *ctx) {
+    VPPContext *vpp = ctx->priv;
+    mfxExtVPP3DLut *lut3d_conf = &vpp->lut3d_conf;
+
+    if (lut3d_conf->Header.BufferId == MFX_EXTBUFF_VPP_3DLUT) {
+        av_free(vpp->lut3d_r);
+        av_free(vpp->lut3d_g);
+        av_free(vpp->lut3d_b);
+        vpp->lut3d_r = NULL;
+        vpp->lut3d_g = NULL;
+        vpp->lut3d_b = NULL;
+    }
+    memset(lut3d_conf, 0, sizeof(*lut3d_conf));
+}
+#endif // QSV_ONEVPL
+
 static int vpp_set_frame_ext_params(AVFilterContext *ctx, const AVFrame *in, AVFrame *out,  QSVVPPFrameParam *fp)
 {
 #if QSV_ONEVPL
@@ -499,6 +576,10 @@ static int vpp_set_frame_ext_params(AVFilterContext *ctx, const AVFrame *in, AVF
     outvsi_conf.MatrixCoefficients       = (out->colorspace == AVCOL_SPC_UNSPECIFIED) ? AVCOL_SPC_BT709 : out->colorspace;
     outvsi_conf.ColourDescriptionPresent = 1;
 
+    // 3D LUT does not depend on in/out frame, so initialize just once.
+    if (vpp->lut3d.file && (vpp->lut3d_conf.Header.BufferId == 0))
+        init_3dlut_surface(ctx);
+
     if (memcmp(&vpp->invsi_conf, &invsi_conf, sizeof(mfxExtVideoSignalInfo)) ||
         memcmp(&vpp->mdcv_conf, &mdcv_conf, sizeof(mfxExtMasteringDisplayColourVolume)) ||
         memcmp(&vpp->clli_conf, &clli_conf, sizeof(mfxExtContentLightLevelInfo)) ||
@@ -516,6 +597,9 @@ static int vpp_set_frame_ext_params(AVFilterContext *ctx, const AVFrame *in, AVF
         vpp->clli_conf                     = clli_conf;
         if (clli_conf.Header.BufferId)
             fp->ext_buf[fp->num_ext_buf++] = (mfxExtBuffer*)&vpp->clli_conf;
+
+        if (vpp->lut3d_conf.Header.BufferId)
+            fp->ext_buf[fp->num_ext_buf++] = (mfxExtBuffer *)&vpp->lut3d_conf;
     }
 #endif
 
@@ -711,9 +795,22 @@ static int config_output(AVFilterLink *outlink)
         vpp->color_transfer != AVCOL_TRC_UNSPECIFIED ||
         vpp->color_matrix != AVCOL_SPC_UNSPECIFIED ||
         vpp->tonemap ||
-        !vpp->has_passthrough)
+#if QSV_ONEVPL
+        vpp->lut3d.file ||
+#endif
+        !vpp->has_passthrough) {
+#if QSV_ONEVPL
+        if (vpp->lut3d.file) {
+            int ret;
+            av_log(ctx, AV_LOG_INFO, "Load 3D LUT from file: %s\n", vpp->lut3d.file);
+            av_log(ctx, AV_LOG_INFO, "For oneVPL-intel-gpu, must use version >= 24.1.1 to correctly apply 3D LUT.\n");
+            ret = ff_lut3d_init(ctx, &vpp->lut3d);
+            if (ret != 0)
+                return ret;
+        }
+#endif
         return ff_qsvvpp_init(ctx, &param);
-    else {
+    } else {
         /* No MFX session is created in this case */
         av_log(ctx, AV_LOG_VERBOSE, "qsv vpp pass through mode.\n");
         if (inlink->hw_frames_ctx)
@@ -801,6 +898,14 @@ eof:
 
 static av_cold void vpp_uninit(AVFilterContext *ctx)
 {
+    VPPContext *vpp = ctx->priv;
+
+#if QSV_ONEVPL
+    uninit_3dlut_surface(ctx);
+    if (vpp->lut3d.file)
+        ff_lut3d_uninit(&vpp->lut3d);
+#endif
+
     ff_qsvvpp_close(ctx);
 }
 
@@ -924,7 +1029,9 @@ static const AVOption vpp_options[] = {
       OFFSET(color_transfer_str),  AV_OPT_TYPE_STRING, { .str = NULL }, .flags = FLAGS },
 
     {"tonemap", "Perform tonemapping (0=disable tonemapping, 1=perform tonemapping if the input has HDR metadata)", OFFSET(tonemap), AV_OPT_TYPE_INT, {.i64 = 0 }, 0, 1, .flags = FLAGS},
-
+#if QSV_ONEVPL
+    { "lut3d_file", "Load and apply 3D LUT file", OFFSET(lut3d) + offsetof(LUT3DContext, file), AV_OPT_TYPE_STRING, { .str = NULL }, .flags = FLAGS },
+#endif
     { NULL }
 };
 
