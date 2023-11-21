@@ -511,7 +511,6 @@ static int init_3dlut_surface(AVFilterContext *ctx)
 
     // Copy 3D LUT to surface.
     memset(surface_u16, 0, surface_image.width * surface_image.height * 4);
-#define INTEL_3DLUT_SCALE (UINT16_MAX - 1)
     for (r = 0; r < lut_size; ++r) {
         for (g = 0; g < lut_size; ++g) {
             for (b = 0; b < lut_size; ++b) {
@@ -519,14 +518,13 @@ static int init_3dlut_surface(AVFilterContext *ctx)
                 s = &lut3d->lut[lut_idx];
 
                 sf_idx = (r * lut_size * mul_size + g * mul_size + b) * 4;
-                surface_u16[sf_idx + 0] = (mfxU16)(s->r * INTEL_3DLUT_SCALE);
-                surface_u16[sf_idx + 1] = (mfxU16)(s->g * INTEL_3DLUT_SCALE);
-                surface_u16[sf_idx + 2] = (mfxU16)(s->b * INTEL_3DLUT_SCALE);
+                surface_u16[sf_idx + 0] = (mfxU16)(s->r * UINT16_MAX);
+                surface_u16[sf_idx + 1] = (mfxU16)(s->g * UINT16_MAX);
+                surface_u16[sf_idx + 2] = (mfxU16)(s->b * UINT16_MAX);
                 // surface_u16[sf_idx + 4] is reserved channel.
             }
         }
     }
-#undef INTEL_3DLUT_SCALE
 
     if (vaUnmapBuffer(va_dpy, surface_image.buf)) {
         av_log(ctx, AV_LOG_ERROR, "vaUnmapBuffer for 3D LUT surface failed, status: %d %s\n", ret, vaErrorStr(ret));
