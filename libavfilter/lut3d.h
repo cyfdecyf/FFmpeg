@@ -84,4 +84,17 @@ typedef struct ThreadData {
 
 void ff_lut3d_init_x86(LUT3DContext *s, const AVPixFmtDescriptor *desc);
 
+int ff_allocate_3dlut(AVFilterContext *ctx, LUT3DContext *lut3d, int lutsize, int prelut);
+
+/**
+ * Load 3D LUT from file.
+ *
+ * @param lut3d LUT3DContext Load 3D LUT from path specified by `lut3d->file`.
+ *     If `lut3d->file` is NULL, initialize an identity 3D LUT.
+ */
+int ff_lut3d_init(AVFilterContext *ctx, LUT3DContext *lut3d);
+
+/**  Release memory used to hold 3D LUT. */
+void ff_lut3d_uninit(LUT3DContext *lut3d);
+
 #endif /* AVFILTER_LUT3D_H */
