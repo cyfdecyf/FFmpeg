@@ -398,7 +398,7 @@ static mfxStatus get_mfx_version(const AVFilterContext *ctx, mfxVersion *mfx_ver
 
 #if QSV_ONEVPL
 // Create 3D LUT surface using system memory.
-// Reference https://spec.oneapi.io/onevpl/2.9.0/programming_guide/VPL_prg_vpp.html#video-processing-3dlut
+// Reference https://intel.github.io/libvpl/latest/programming_guide/VPL_prg_vpp.html#video-processing-3dlut
 static void init_3dlut_surface(AVFilterContext *ctx)
 {
     VPPContext *vpp = ctx->priv;
@@ -577,7 +577,7 @@ static int vpp_set_frame_ext_params(AVFilterContext *ctx, const AVFrame *in, AVF
     outvsi_conf.ColourDescriptionPresent = 1;
 
     // 3D LUT does not depend on in/out frame, so initialize just once.
-    if (vpp->lut3d.file && (vpp->lut3d_conf.Header.BufferId == 0))
+    if ((vpp->lut3d_conf.Header.BufferId == 0) && vpp->lut3d.file)
         init_3dlut_surface(ctx);
 
     if (memcmp(&vpp->invsi_conf, &invsi_conf, sizeof(mfxExtVideoSignalInfo)) ||
@@ -787,6 +787,26 @@ static int config_output(AVFilterLink *outlink)
 #undef INIT_MFX_EXTBUF
 #undef SET_MFX_PARAM_FIELD
 
+#if QSV_ONEVPL
+    if (vpp->lut3d.file) {
+        if (QSV_RUNTIME_VERSION_ATLEAST(mfx_version, 2, 11)) {
+            // For oneVPL-intel-gpu, lowest version that works for applying 3D LUT
+            // is 24.1.1 which has API version 2.10.
+            // By requiring runtime version 2.11, we ensure using a working version.
+            int ret;
+            av_log(ctx, AV_LOG_INFO, "Load 3D LUT from file: %s\n", vpp->lut3d.file);
+            ret = ff_lut3d_init(ctx, &vpp->lut3d);
+            if (ret != 0)
+                return ret;
+        } else {
+            av_free(vpp->lut3d.file);
+            vpp->lut3d.file = NULL;
+            av_log(ctx, AV_LOG_WARNING, "The QSV VPP 3D LUT processing option "
+                   "lut3d_file is not supported with this MSDK version.\n");
+        }
+    }
+#endif
+
     if (vpp->use_frc || vpp->use_crop || vpp->deinterlace || vpp->denoise ||
         vpp->detail || vpp->procamp || vpp->rotate || vpp->hflip ||
         inlink->w != outlink->w || inlink->h != outlink->h || in_format != vpp->out_format ||
@@ -798,19 +818,9 @@ static int config_output(AVFilterLink *outlink)
 #if QSV_ONEVPL
         vpp->lut3d.file ||
 #endif
-        !vpp->has_passthrough) {
-#if QSV_ONEVPL
-        if (vpp->lut3d.file) {
-            int ret;
-            av_log(ctx, AV_LOG_INFO, "Load 3D LUT from file: %s\n", vpp->lut3d.file);
-            av_log(ctx, AV_LOG_INFO, "For oneVPL-intel-gpu, must use version >= 24.1.1 to correctly apply 3D LUT.\n");
-            ret = ff_lut3d_init(ctx, &vpp->lut3d);
-            if (ret != 0)
-                return ret;
-        }
-#endif
+        !vpp->has_passthrough)
         return ff_qsvvpp_init(ctx, &param);
-    } else {
+    else {
         /* No MFX session is created in this case */
         av_log(ctx, AV_LOG_VERBOSE, "qsv vpp pass through mode.\n");
         if (inlink->hw_frames_ctx)
@@ -898,9 +908,9 @@ eof:
 
 static av_cold void vpp_uninit(AVFilterContext *ctx)
 {
+#if QSV_ONEVPL
     VPPContext *vpp = ctx->priv;
 
-#if QSV_ONEVPL
     uninit_3dlut_surface(ctx);
     if (vpp->lut3d.file)
         ff_lut3d_uninit(&vpp->lut3d);
