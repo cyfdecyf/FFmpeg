@@ -60,7 +60,8 @@ typedef struct LUT3DContext {
     int lutsize2;
     struct rgbvec scale;
     int interpolation;          ///<interp_mode
-    char *file;
+    char *lut_text;
+    int lut_text_len;
     uint8_t rgba_map[4];
     int step;
     avfilter_action_func *interp;

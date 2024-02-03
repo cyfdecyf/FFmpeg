@@ -121,6 +121,64 @@ static int set_identity_matrix(AVFilterContext *ctx, LUT3DContext *lut3d, int si
 
 #define MAX_LINE_SIZE 512
 
+typedef struct LUTReader {
+    const char *buf;
+    size_t buf_len;
+    size_t buf_pos;
+} LUTReader;
+
+static void lut_reader_init(LUTReader *r, const char* buf, size_t buf_len)
+{
+    r->buf = buf;
+    r->buf_len = buf_len;
+    r->buf_pos = 0;
+}
+
+static inline int lut_reader_eof(LUTReader *r)
+{
+    return r->buf_pos >= r->buf_len;
+}
+
+static int lut_reader_getc(LUTReader *r)
+{
+    if (lut_reader_eof(r))
+        return EOF;
+    return r->buf[r->buf_pos++];
+}
+
+static int lut_reader_next_word(LUTReader *r)
+{
+
+}
+
+// Return start of line, advance position to start of next line.
+static char *lut_reader_read_line(LUTReader *r, char *buf, size_t *size)
+{
+    size_t cur = 0;
+    if (!size)
+        return 0;
+    buf[0] = '\0';
+    while (cur + 1 < size) {
+        unsigned char c = lut_reader_read_char(tr);
+        if (!c)
+            return lut_reader_eof(tr) ? cur : AVERROR_INVALIDDATA;
+        if (c == '\r' || c == '\n')
+            break;
+        buf[cur++] = c;
+        buf[cur] = '\0';
+    }
+    while (ff_text_peek_r8(tr) == '\r')
+        ff_text_r8(tr);
+    if (ff_text_peek_r8(tr) == '\n')
+        ff_text_r8(tr);
+    return cur;
+}
+
+static int lut_reader_skip_line(LUTReader *r)
+{
+
+}
+
 static int skip_line(const char *p)
 {
     while (*p && av_isspace(*p))
@@ -603,6 +661,43 @@ end:
         av_freep(&in_prelut[c]);
         av_freep(&out_prelut[c]);
     }
+    return ret;
+}
+
+av_cold int ff_lut3d_init_using_reader(AVFilterContext *ctx, LUT3DContext *lut3d,
+                                       const char* lut_type, const char* text, size_t text_len)
+{
+    int ret;
+    LUTReader reader;
+
+    lut3d->scale.r = lut3d->scale.g = lut3d->scale.b = 1.f;
+
+    if (text_len == 0) {
+        return set_identity_matrix(ctx, lut3d, 32);
+    }
+
+    lut_reader_init(&reader, text, text_len);
+
+    if (!av_strcasecmp(lut_type, "dat")) {
+        ret = parse_dat(ctx, lut3d, f);
+    } else if (!av_strcasecmp(lut_type, "3dl")) {
+        ret = parse_3dl(ctx, lut3d, f);
+    } else if (!av_strcasecmp(lut_type, "cube")) {
+        ret = parse_cube(ctx, lut3d, f);
+    } else if (!av_strcasecmp(lut_type, "m3d")) {
+        ret = parse_m3d(ctx, lut3d, f);
+    } else if (!av_strcasecmp(lut_type, "csp")) {
+        ret = parse_cinespace(ctx, lut3d, f);
+    } else {
+        av_log(ctx, AV_LOG_ERROR, "Unrecognized '.%s' LUT lut_type\n", lut_type);
+        ret = AVERROR(EINVAL);
+    }
+
+    if (!ret && !lut3d->lutsize) {
+        av_log(ctx, AV_LOG_ERROR, "3D LUT is empty\n");
+        ret = AVERROR_INVALIDDATA;
+    }
+
     return ret;
 }
 
